@@ -128,6 +128,9 @@
   .dropzone h3{margin:0 0 6px;font-size:16px;font-weight:400;}
   .dropzone p{margin:0;color:var(--ink-dim);font-size:13px;}
   .dropzone .hint{margin-top:10px;font-size:11.5px;color:var(--ink-faint);}
+  .dz-status{font-family:'IBM Plex Mono',monospace;}
+  .dz-status .dz-line{font-size:13px;color:var(--blue);margin-bottom:8px;opacity:0;animation:boot-in .2s forwards;}
+  .dz-status .dz-line:last-child{margin-bottom:0;}
   input[type=file]{display:none;}
 
   .compact-bar{
@@ -140,7 +143,6 @@
   .compact-bar .info b{color:var(--blue);}
 
   #status-msg{font-size:12.5px;color:var(--blue);margin:-6px 0 18px;min-height:16px;}
-  #status-msg .boot-line{opacity:0;animation:boot-in .2s forwards;}
   @keyframes boot-in{to{opacity:1;}}
   #status-msg.error{color:var(--declined);}
 
@@ -227,15 +229,18 @@
 
   /* ---------- files strip ---------- */
   .files-panel{background:var(--paper-alt);border:1.5px solid var(--ink);border-radius:4px;padding:18px 22px;margin-bottom:10px;box-shadow:3px 3px 0 var(--line);}
-  .files-panel h2{margin:0 0 12px;font-size:16px;font-weight:400;}
-  .files-list{display:flex;flex-direction:column;gap:6px;}
+  .files-toggle{display:flex;align-items:center;justify-content:space-between;width:100%;background:none;border:none;padding:0;margin:0;cursor:pointer;font-family:inherit;text-align:left;}
+  .files-toggle h2{margin:0;font-size:16px;font-weight:400;color:var(--ink);}
+  .files-count{font-size:12px;color:var(--ink-dim);font-weight:600;margin-left:8px;}
+  .files-chevron{font-size:13px;color:var(--ink-dim);transition:transform .15s;flex:none;}
+  .files-toggle.expanded .files-chevron{transform:rotate(90deg);}
+  .files-list{margin-top:12px;display:flex;flex-direction:column;gap:6px;}
   .file-row{
     display:flex;align-items:center;justify-content:space-between;gap:16px;
     background:var(--paper);border:1px dashed var(--line);border-radius:3px;
     padding:8px 12px;font-size:12px;color:var(--ink-dim);
   }
   .file-row b{color:var(--ink);font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .file-row .file-meta{flex:none;white-space:nowrap;}
 
   /* ---------- transactions tab ---------- */
   .filter-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;}
@@ -382,10 +387,13 @@
   </header>
 
   <div class="dropzone" id="dropzone">
-    <div class="icon">&#9660;</div>
-    <h3>Drop system day and/or OS log archives here</h3>
-    <p>or click to browse — accepts .zip exports of system.dayYYYYMMDD.log files and/or pinpad OS log bundles (scaapp*.log) as .zip or the raw .tgz/.tar.gz · drop several at once, or add more later</p>
-    <div class="hint">parsing runs entirely in your browser — nothing leaves this machine</div>
+    <div class="dz-idle">
+      <div class="icon">&#9660;</div>
+      <h3>Drop system day and/or OS log archives here</h3>
+      <p>or click to browse — accepts .zip exports of system.dayYYYYMMDD.log files and/or pinpad OS log bundles (scaapp*.log) as .zip or the raw .tgz/.tar.gz · drop several at once, or add more later</p>
+      <div class="hint">parsing runs entirely in your browser — nothing leaves this machine</div>
+    </div>
+    <div class="dz-status" id="dzStatus" style="display:none;"></div>
     <input type="file" id="fileInput" accept=".zip,.tgz,.tar.gz,.tar" multiple>
   </div>
 
@@ -477,8 +485,11 @@
     </div>
 
     <div class="files-panel">
-      <h2>Log Files Parsed</h2>
-      <div class="files-list" id="filesGrid"></div>
+      <button class="files-toggle" id="filesToggleBtn" type="button" aria-expanded="false">
+        <h2>Log Files Parsed <span class="files-count" id="filesCount">0 files</span></h2>
+        <span class="files-chevron" id="filesChevron">&#9656;</span>
+      </button>
+      <div class="files-list" id="filesGrid" style="display:none;"></div>
     </div>
     <div class="footnote" id="parseFootnote"></div>
   </section>
@@ -1563,10 +1574,35 @@
     document.getElementById('tab-transactions').classList.remove('active');
     statusMsg.textContent = '';
     fileInput.value = '';
+    showDropzoneIdle();
+  });
+  document.getElementById('filesToggleBtn').addEventListener('click', () => {
+    const btn = document.getElementById('filesToggleBtn');
+    const list = document.getElementById('filesGrid');
+    const expanded = list.style.display !== 'none';
+    list.style.display = expanded ? 'none' : 'block';
+    btn.classList.toggle('expanded', !expanded);
+    btn.setAttribute('aria-expanded', String(!expanded));
   });
   async function handleFiles(fileList){
-    for(const file of Array.from(fileList)){
-      await handleFile(file);
+    const files = Array.from(fileList);
+    if(!files.length) return;
+    resetBoot();
+    const archiveTotal = files.length;
+    if(archiveTotal > 1) bootLine(`loading ${archiveTotal} archives…`);
+    for(let i = 0; i < files.length; i++){
+      await handleFile(files[i], {archiveIndex: i + 1, archiveTotal});
+    }
+    if(ARCHIVES_LOADED.length){
+      if(archiveTotal > 1){
+        bootLine(`done — ${ARCHIVES_LOADED.length} archive(s), ${FILES_META.length} log file(s), ${RECORDS.length} transaction(s) found`);
+      }
+      await wait(260);
+      renderAll();
+    } else {
+      // Nothing in this batch succeeded — restore the drop zone's normal instructions
+      // instead of leaving it stuck on a half-finished status line.
+      showDropzoneIdle();
     }
   }
 
@@ -1574,28 +1610,48 @@
     statusMsg.textContent = text;
     statusMsg.className = isError ? 'error' : '';
   }
+  // Live loading feedback now displays inside the drop zone itself (replacing its normal
+  // instructions while active) rather than in a separate line below it — keeps the "something
+  // is happening right here" signal in the same visual spot the user is already looking at.
+  function showDropzoneIdle(){
+    const idle = dropzone.querySelector('.dz-idle');
+    const status = document.getElementById('dzStatus');
+    if(idle) idle.style.display = '';
+    if(status){ status.style.display = 'none'; status.innerHTML = ''; }
+  }
+  function showDropzoneStatus(){
+    const idle = dropzone.querySelector('.dz-idle');
+    const status = document.getElementById('dzStatus');
+    if(idle) idle.style.display = 'none';
+    if(status) status.style.display = 'block';
+  }
   function bootLine(text){
+    showDropzoneStatus();
+    const status = document.getElementById('dzStatus');
     const line = document.createElement('div');
-    line.className = 'boot-line';
+    line.className = 'dz-line';
     line.textContent = '> ' + text;
-    statusMsg.appendChild(line);
+    status.appendChild(line);
   }
   // Updates a single line in place rather than appending a new one each call — used for
   // per-file parsing progress so a multi-file archive doesn't spam the boot log with one
-  // line per file; it just shows "parsing X (3/7)…" ticking up in place.
+  // line per file; it just shows "archive 4 of 16 — file 7 of 7…" ticking up in place.
   function bootProgress(text){
-    let el = document.getElementById('bootProgressLine');
+    showDropzoneStatus();
+    const status = document.getElementById('dzStatus');
+    let el = document.getElementById('dzProgressLine');
     if(!el){
       el = document.createElement('div');
-      el.className = 'boot-line';
-      el.id = 'bootProgressLine';
-      statusMsg.appendChild(el);
+      el.className = 'dz-line';
+      el.id = 'dzProgressLine';
+      status.appendChild(el);
     }
     el.textContent = '> ' + text;
   }
   function resetBoot(){
-    statusMsg.className = '';
-    statusMsg.innerHTML = '';
+    const status = document.getElementById('dzStatus');
+    status.innerHTML = '';
+    showDropzoneStatus();
   }
   const wait = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1800,7 +1856,9 @@
     return expandArchiveBytes(file.name, bytes, 0);
   }
 
-  async function handleFile(file){
+  async function handleFile(file, batchInfo){
+    const {archiveIndex, archiveTotal} = batchInfo || {archiveIndex: 1, archiveTotal: 1};
+    const singleMode = archiveTotal === 1;
     if(isLoading){
       setStatus('Still processing the previous archive — please wait for it to finish before adding another.', true);
       return;
@@ -1811,8 +1869,8 @@
     }
     isLoading = true;
     setLoadingUI(true);
-    resetBoot();
-    bootLine(`mounting ${file.name}…`);
+    if(singleMode) bootLine(`mounting ${file.name}…`);
+    else bootProgress(`archive ${archiveIndex} of ${archiveTotal}…`);
     try{
       const rawEntries = await readArchiveEntries(file);
       const systemdayEntries = [], oslogEntries = [];
@@ -1834,27 +1892,32 @@
       const filenameSerial = storeIdFromFilename(file.name);
       const contentSerial = extractSerialFromEntries([...systemdayEntries, ...oslogEntries]);
       const serial = contentSerial || filenameSerial || null;
-      await wait(160);
-      bootLine(`found ${systemdayEntries.length} system day log(s), ${oslogEntries.length} OS log(s)`);
-      await wait(160);
-      bootLine('scanning for SAF / ISAF / CSAF activity…');
+      if(singleMode){
+        await wait(160);
+        bootLine(`found ${systemdayEntries.length} system day log(s), ${oslogEntries.length} OS log(s)`);
+        await wait(160);
+        bootLine('scanning for SAF / ISAF / CSAF activity…');
+      }
+      // Progress is always numeric — never the filename — so a large batch doesn't turn into
+      // a wall of text ticking through hundreds of names.
       if(systemdayEntries.length){
         await parseArchive(systemdayEntries, SAF_RECORD_MAP, serial, (name, i, total) => {
-          bootProgress(`parsing ${name} (${i}/${total})…`);
+          bootProgress(singleMode ? `reading file ${i} of ${total}…` : `archive ${archiveIndex} of ${archiveTotal} — file ${i} of ${total}…`);
         });
       }
       if(oslogEntries.length){
         await parseOSLogEntries(oslogEntries, serial, SAF_RECORD_MAP, (name, i, total) => {
-          bootProgress(`reading ${name} (${i}/${total})…`);
+          bootProgress(singleMode ? `reading file ${i} of ${total}…` : `archive ${archiveIndex} of ${archiveTotal} — file ${i} of ${total}…`);
         });
       }
       buildRecordsArray();
       const theseFileNames = [...systemdayEntries.map(e => e.name), ...oslogEntries.map(e => e.name)];
       const touchedCount = countRecordsTouchedByFiles(SAF_RECORD_MAP, theseFileNames);
       ARCHIVES_LOADED.push({name: file.name, serial, sysCount: systemdayEntries.length, osCount: oslogEntries.length, zeroActivity: touchedCount === 0});
-      bootLine(`reconstructed ${RECORDS.length} transaction(s) across ${ARCHIVES_LOADED.length} archive(s)`);
-      await wait(260);
-      renderAll();
+      if(singleMode){
+        bootLine(`reconstructed ${RECORDS.length} transaction(s) across ${ARCHIVES_LOADED.length} archive(s)`);
+        await wait(260);
+      }
     } catch(err){
       console.error(err);
       setStatus(`Could not read "${file.name}": ` + err.message, true);
@@ -1881,7 +1944,7 @@
     const serialLabels = [...new Set(ARCHIVES_LOADED.map(a => a.serial).filter(Boolean))];
     const compactName = ARCHIVES_LOADED.length === 1
       ? (serialLabels[0] ? `${serialLabels[0]} — ${ARCHIVES_LOADED[0].name}` : ARCHIVES_LOADED[0].name)
-      : `${ARCHIVES_LOADED.length} archives loaded` + (serialLabels.length ? ` (${serialLabels.join(', ')})` : '');
+      : `${ARCHIVES_LOADED.length} archives loaded` + (serialLabels.length ? ` across ${serialLabels.length} terminal(s)` : '');
     document.getElementById('compactName').textContent = compactName || '—';
     document.getElementById('compactMeta').textContent =
       FILES_META.length + ' log file(s) · ' + RECORDS.length + ' SAF transaction(s) found';
@@ -2126,13 +2189,12 @@
     const list = document.getElementById('filesGrid');
     list.innerHTML = '';
     const sorted = [...FILES_META].sort((a,b) => (a.dateKey||a.name).localeCompare(b.dateKey||b.name));
+    document.getElementById('filesCount').textContent = sorted.length + (sorted.length === 1 ? ' file' : ' files');
     for(const f of sorted){
       const div = document.createElement('div');
       div.className = 'file-row';
-      const label = f.dateKey ? `${f.dateKey} — ${f.name}` : f.name;
-      const sourceTag = f.source === 'oslog' ? 'OS log' : 'Systemday';
-      const serialTag = f.serial ? ` · ${escapeHtml(f.serial)}` : '';
-      div.innerHTML = `<b>${escapeHtml(label)}</b><span class="file-meta">${f.lineCount} line(s) · ${sourceTag}${serialTag}</span>`;
+      const label = f.serial ? `${f.serial} — ${f.name}` : f.name;
+      div.innerHTML = `<b>${escapeHtml(label)}</b>`;
       list.appendChild(div);
     }
   }
@@ -2149,6 +2211,7 @@
     statusFilterBar.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
     currentStatusFilter = btn.dataset.status;
+    refreshSerialFilterPills();
     applyFilters();
   });
   sourceFilterBar.addEventListener('click', e => {
@@ -2157,6 +2220,7 @@
     sourceFilterBar.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
     currentSourceFilter = btn.dataset.source;
+    refreshSerialFilterPills();
     applyFilters();
   });
   const serialFilterBar = document.getElementById('serialFilter');
@@ -2168,11 +2232,15 @@
     currentSerialFilter = btn.dataset.serial;
     applyFilters();
   });
-  // rebuilt every time archives load — there's no way to know the set of serial numbers
-  // in play until the logs are actually parsed, and it only needs to show up at all
-  // once more than one device is present in the session (that's the whole point of it).
+  // Rebuilt on every archive load AND whenever the status/source filters change — the list of
+  // serials on offer should only ever include ones that actually exist under the currently
+  // selected status/source, so picking "Systemday" never leaves an OS-log-only serial visible.
   function refreshSerialFilterPills(){
-    const serials = [...new Set(RECORDS.map(r => r.serial).filter(Boolean))].sort();
+    const scoped = RECORDS.filter(r =>
+      (currentStatusFilter === 'ALL' || r.status === currentStatusFilter) &&
+      (currentSourceFilter === 'ALL' || r.source === currentSourceFilter)
+    );
+    const serials = [...new Set(scoped.map(r => r.serial).filter(Boolean))].sort();
     if(currentSerialFilter !== 'ALL' && !serials.includes(currentSerialFilter)) currentSerialFilter = 'ALL';
     if(serials.length < 1){
       serialFilterBar.style.display = 'none';
