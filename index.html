@@ -604,7 +604,7 @@
 
       <h4>Loading logs</h4>
       <p>Drag a <b>.zip</b>, <b>.tgz</b>/<b>.tar.gz</b>, or <b>.tar</b> archive onto the drop zone, or click it to browse. Archives nested inside other archives are unwrapped automatically. Accepted logs: <code>system.dayYYYYMMDD.log</code> exports and <code>scaapp*.log</code> pinpad OS log bundles.</p>
-      <p><b>OS-log SAF formats.</b> Two <code>scaapp*.log</code> formats are recognised. Older builds log SAF as <code>ADDRECORD</code> (ELIGIBLE) / <code>UPDATERECORD</code> lines. Newer builds log each offline approval as an <code>SCI_RESPONSE</code> whose XML body contains <code>&lt;RESULT&gt;APPROVED/STORED&lt;/RESULT&gt;</code>; each is listed as one <b>Pending</b> record keyed on its <code>SAF_NUM</code> (or <code>INTRN_SEQ_NUM</code> on builds that send no SAF number; invoice numbers repeat, so they aren't used as the key), however many times the response is repeated in the log. Resolution (CSAF/ISAF) isn't detected for this newer format yet, so those records stay Pending.</p>
+      <p><b>OS-log SAF formats.</b> Two <code>scaapp*.log</code> formats are recognised. Older builds log SAF as <code>ADDRECORD</code> (ELIGIBLE) / <code>UPDATERECORD</code> lines. Newer builds log each offline approval as an <code>SCI_RESPONSE</code> whose XML body contains <code>&lt;RESULT&gt;APPROVED/STORED&lt;/RESULT&gt;</code>; each is listed as one <b>Pending</b> record keyed on its <code>SAF_NUM</code> (or <code>INTRN_SEQ_NUM</code> on builds that send no SAF number; invoice numbers repeat, so they aren't used as the key), however many times the response is repeated in the log. Their outcome comes from the terminal's forward attempts (<code>SAF_FLAG=1</code> host requests): a <code>CAPTURED</code> response marks the sale <b>Approved</b>, <code>DECLINED</code> marks it <b>Declined</b>, and <code>ERROR</code> is counted as a retry while it stays <b>Pending</b>. The queue is first-in-first-out, so one sale that keeps erroring blocks every sale behind it — the Retries column shows it. If a bundle logs both formats for the same sale it is counted once.</p>
       <p>After your first archive loads, use <b>"+ Add another archive"</b> to merge in more stores/exports into the same session, or <b>"Clear &amp; start over"</b> to reset everything.</p>
 
       <h4>Terms</h4>
@@ -1575,13 +1575,22 @@
      and the earliest occurrence supplies createdAt. The XML may be pretty-printed (one tag per
      line) or single-line — both are handled because fields are read from the merged text.
 
-     TODO (resolution not implemented — no drained-device sample in this format yet). Candidate
-     log lines to key off once one is available:
+     Resolution comes from the forward attempts, not from the "Purged" lines. When the
+     terminal re-sends a stored sale to the host it logs a HOST_REQUEST / SSI_REQUEST carrying
+     <SAF_FLAG>1</SAF_FLAG> (plus <ORIG_TRANS_DATE>/<ORIG_TRANS_TIME> of the original sale);
+     the next HOST_RESPONSE / SSI_RESPONSE says what the host did: RESULT CAPTURED = approved,
+     DECLINED = declined, anything else (ERROR, no response) = still queued, one more retry.
+     The queue is FIFO, so one sale that keeps erroring at the head blocks every sale behind it.
+     A forward whose original sale is not in the log window synthesizes a PENDING record from
+     the request itself, as the UPDATERECORD fallback above does.
+     Still NOT used as resolution evidence (ambiguous — they do not say approved vs. declined):
        - "SAF Records Present to Post it to SSI"
        - "Successfully Purged SAF Records"
        - "Request Successfully Posted and Received Response Successfully From SSI Host"
-     "Purged" is AMBIGUOUS — it does not by itself say approved vs. declined, so it must not be
-     mapped to either. Until then every record created here stays PENDING. */
+
+     Builds that log BOTH this format and ADDRECORD(ELIGIBLE) describe the same sale twice; a
+     still-PENDING ADDRECORD record with the same invoice+amount is replaced by the SSI one
+     (its raw lines are carried over) so the sale is counted once. */
   async function parseSsiOfflineStored(fileEntries, serial, records){
     const allEntries = [];
     for(const entry of fileEntries){
@@ -1604,37 +1613,139 @@
       const m = xml.match(new RegExp('<' + name + '>([^<]*)</' + name + '>'));
       return m ? m[1].trim() : '';
     };
+    const isReq = tag => tag === 'HOST_REQUEST' || tag === 'SSI_REQUEST';
+    const isRes = tag => tag === 'HOST_RESPONSE' || tag === 'SSI_RESPONSE';
+    const origToNormalized = (d, t) => {
+      const m = d.match(/^(\d{4})\.(\d{2})\.(\d{2})$/), n = t.match(/^(\d{2}):(\d{2}):(\d{2})$/);
+      return (m && n) ? `${m[1]}/${m[2]}/${m[3]} ${n[1]}:${n[2]}:${n[3]}.000` : null;
+    };
+    const WINDOW_MS = 120000; // original-time vs. logged-time tolerance when matching a forward to its sale
+    // invoice|amount -> [{key, rec}] for every OS-log record of this terminal already in the map
+    const byInvAmt = new Map();
+    const indexRec = (key, rec) => {
+      const k = rec.invoice + '|' + rec.amount.toFixed(2);
+      if(!byInvAmt.has(k)) byInvAmt.set(k, []);
+      byInvAmt.get(k).push({key, rec});
+    };
+    for(const [key, rec] of records){
+      if(rec.source === 'oslog' && rec.serial === serial) indexRec(key, rec);
+    }
+    const closest = (cands, ts) => {
+      const t0 = parseNormalizedTs(ts);
+      let best = null, bestD = Infinity;
+      for(const c of cands){
+        const d = Math.abs((parseNormalizedTs(c.rec.createdAt) || 0) - t0);
+        if(d < bestD){ best = c; bestD = d; }
+      }
+      return bestD <= WINDOW_MS ? best : null;
+    };
+    const makeRec = (o) => Object.assign({
+      attempts: [], resolvedAt: null, resolutionReason: '', counters: null,
+      rawLines: [], source: 'oslog', status: 'PENDING', serial
+    }, o);
+
     for(let i = 0; i < allEntries.length; i++){
       const e = allEntries[i];
-      if(e.tag !== 'SCI_RESPONSE' || e.content.indexOf('<RESULT>APPROVED/STORED</RESULT>') < 0) continue;
-      // Key preference: SAF_NUM, then TRANS_SEQ_NUM, then (builds that send neither) the
-      // device's INTRN_SEQ_NUM under its own prefix so it can never collide with a SAF number.
-      const safNum = xmlField(e.content, 'SAF_NUM') || xmlField(e.content, 'TRANS_SEQ_NUM');
-      const intrnNum = safNum ? '' : xmlField(e.content, 'INTRN_SEQ_NUM');
-      if(!safNum && !intrnNum) continue;
-      const recKey = recordKey(serial, safNum ? 'SAF-' + safNum : 'INTRN-' + intrnNum);
-      if(records.has(recKey)) continue; // same SAF_NUM already seen (overlapping rotated file / archive)
-      const tsNorm = normalizeOsTs(e.tsRaw);
-      const body = e.content.replace(/\s+/g, ' ').trim();
-      const cleanRaw = (e.tsRaw + '   ' + e.tag + '   ' + body).slice(0, 600) + (body.length > 600 ? '…' : '');
-      records.set(recKey, {
-        invoice: xmlField(e.content, 'INVOICE'),
-        description: `${xmlField(e.content, 'PAYMENT_TYPE')} SALE`.trim(),
-        amount: parseFloat(xmlField(e.content, 'TRANS_AMOUNT')) || 0,
-        createdAt: tsNorm,
-        createdFile: e.file,
-        status: 'PENDING',
-        attempts: [],
-        resolvedAt: null,
-        resolutionReason: '',
-        counters: null,
-        rawLines: [{ts: tsNorm, raw: cleanRaw, file: e.file}],
-        source: 'oslog',
-        card: `${xmlField(e.content, 'PAYMENT_MEDIA')} ${xmlField(e.content, 'ACCT_NUM')}`.trim(),
-        serial
-      });
-      bumpDaily(dateStrFromTs(tsNorm), 'created');
       if(i % 3000 === 0) await yieldToUI();
+
+      if(e.tag === 'SCI_RESPONSE' && e.content.indexOf('<RESULT>APPROVED/STORED</RESULT>') >= 0){
+        // Key preference: SAF_NUM, then TRANS_SEQ_NUM, then (builds that send neither) the
+        // device's INTRN_SEQ_NUM under its own prefix so it can never collide with a SAF number.
+        const safNum = xmlField(e.content, 'SAF_NUM') || xmlField(e.content, 'TRANS_SEQ_NUM');
+        const intrnNum = safNum ? '' : xmlField(e.content, 'INTRN_SEQ_NUM');
+        if(!safNum && !intrnNum) continue;
+        const recKey = recordKey(serial, safNum ? 'SAF-' + safNum : 'INTRN-' + intrnNum);
+        if(records.has(recKey)) continue; // same SAF_NUM already seen (overlapping rotated file / archive)
+        const tsNorm = normalizeOsTs(e.tsRaw);
+        const body = e.content.replace(/\s+/g, ' ').trim();
+        const cleanRaw = (e.tsRaw + '   ' + e.tag + '   ' + body).slice(0, 600) + (body.length > 600 ? '…' : '');
+        const invoice = xmlField(e.content, 'INVOICE');
+        const amount = parseFloat(xmlField(e.content, 'TRANS_AMOUNT')) || 0;
+        const rawLines = [{ts: tsNorm, raw: cleanRaw, file: e.file}];
+        const cands = byInvAmt.get(invoice + '|' + amount.toFixed(2)) || [];
+        const legacy = cands.find(c => !c.rec.ssi && c.rec.createdAt);
+        if(legacy){
+          // same sale already listed from its ADDRECORD line
+          if(legacy.rec.status !== 'PENDING' || legacy.rec.attempts.length) continue; // it carries an outcome — keep it
+          records.delete(legacy.key);
+          cands.splice(cands.indexOf(legacy), 1);
+          const d = DAILY[dateStrFromTs(legacy.rec.createdAt)];
+          if(d && d.created > 0) d.created--;
+          rawLines.unshift(...legacy.rec.rawLines);
+        }
+        const orphan = closest(cands.filter(c => c.rec.fwdOnly), tsNorm);
+        if(orphan){
+          // a forward attempt (earlier archive) already created this sale from its request — adopt the stored response
+          orphan.rec.fwdOnly = false;
+          orphan.rec.rawLines.push(...rawLines);
+          continue;
+        }
+        const rec = makeRec({
+          invoice,
+          description: `${xmlField(e.content, 'PAYMENT_TYPE')} SALE`.trim(),
+          amount,
+          createdAt: tsNorm,
+          createdFile: e.file,
+          rawLines,
+          card: `${xmlField(e.content, 'PAYMENT_MEDIA')} ${xmlField(e.content, 'ACCT_NUM')}`.trim(),
+          ssi: true
+        });
+        records.set(recKey, rec);
+        indexRec(recKey, rec);
+        bumpDaily(dateStrFromTs(tsNorm), 'created');
+        continue;
+      }
+
+      if(isReq(e.tag) && e.content.indexOf('<SAF_FLAG>1</SAF_FLAG>') >= 0){
+        let res = null;
+        for(let j = i + 1; j < allEntries.length && j <= i + 6; j++){
+          if(isRes(allEntries[j].tag)){ res = allEntries[j]; break; }
+          if(isReq(allEntries[j].tag)) break;
+        }
+        const invoice = xmlField(e.content, 'INVOICE');
+        const amount = parseFloat(xmlField(e.content, 'TRANS_AMOUNT')) || 0;
+        const orig = origToNormalized(xmlField(e.content, 'ORIG_TRANS_DATE'), xmlField(e.content, 'ORIG_TRANS_TIME'));
+        const whenRaw = (res || e).tsRaw, when = normalizeOsTs(whenRaw);
+        const cands = byInvAmt.get(invoice + '|' + amount.toFixed(2)) || [];
+        let hit = orig ? closest(cands, orig) : (cands.find(c => c.rec.status === 'PENDING') || null);
+        if(!hit){
+          // the sale was queued before this log window started — list it from the request itself
+          const key = recordKey(serial, 'FWD-' + invoice + '-' + (orig || amount.toFixed(2)));
+          const rec = makeRec({
+            invoice,
+            description: `${xmlField(e.content, 'PAYMENT_TYPE')} SALE`.trim(),
+            amount,
+            createdAt: orig || normalizeOsTs(e.tsRaw),
+            createdFile: e.file,
+            card: xmlField(e.content, 'PAYMENT_MEDIA'),
+            ssi: true,
+            fwdOnly: true
+          });
+          if(!records.has(key)){
+            records.set(key, rec);
+            bumpDaily(dateStrFromTs(rec.createdAt), 'created');
+          }
+          hit = {key, rec: records.get(key)};
+          indexRec(key, hit.rec);
+        }
+        const rec = hit.rec;
+        if(rec.status !== 'PENDING') continue; // already resolved
+        const rt = res ? xmlField(res.content, 'RESULT') : '';
+        const label = res ? (`${rt} ${xmlField(res.content, 'RESPONSE_TEXT')}`.trim() || 'No result text') : 'No response logged';
+        const outcome = (rt === 'CAPTURED' || rt === 'APPROVED') ? 'APPROVED' : (rt === 'DECLINED' ? 'DECLINED' : null);
+        rec.attempts.push({ts: when, stan: '', kind: 'sent', result: label});
+        rec.resolutionReason = label;
+        if(outcome){
+          rec.status = outcome;
+          rec.resolvedAt = when;
+          bumpDaily(dateStrFromTs(when), outcome === 'APPROVED' ? 'approved' : 'declined');
+        }
+        // raw lines: first attempt and the resolving one only (a stuck queue head can retry thousands of times)
+        if(rec.attempts.length === 1 || outcome){
+          const body = (res || e).content.replace(/\s+/g, ' ').trim();
+          rec.rawLines.push({ts: when, raw: (whenRaw + '   ' + (res || e).tag + '   ' + body).slice(0, 600), file: (res || e).file});
+        }
+      }
     }
   }
 
