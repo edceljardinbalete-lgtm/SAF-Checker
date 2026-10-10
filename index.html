@@ -604,7 +604,7 @@
 
       <h4>Loading logs</h4>
       <p>Drag a <b>.zip</b>, <b>.tgz</b>/<b>.tar.gz</b>, or <b>.tar</b> archive onto the drop zone, or click it to browse. Archives nested inside other archives are unwrapped automatically. Accepted logs: <code>system.dayYYYYMMDD.log</code> exports and <code>scaapp*.log</code> pinpad OS log bundles.</p>
-      <p><b>OS-log SAF formats.</b> Two <code>scaapp*.log</code> formats are recognised. Older builds log SAF as <code>ADDRECORD</code> (ELIGIBLE) / <code>UPDATERECORD</code> lines. Newer builds log each offline approval as an <code>SCI_RESPONSE</code> whose XML body contains <code>&lt;RESULT&gt;APPROVED/STORED&lt;/RESULT&gt;</code>; each is listed as one <b>Pending</b> record keyed on its <code>SAF_NUM</code> (invoice numbers repeat across days, so they aren't used as the key). Resolution (CSAF/ISAF) isn't detected for this newer format yet, so those records stay Pending.</p>
+      <p><b>OS-log SAF formats.</b> Two <code>scaapp*.log</code> formats are recognised. Older builds log SAF as <code>ADDRECORD</code> (ELIGIBLE) / <code>UPDATERECORD</code> lines. Newer builds log each offline approval as an <code>SCI_RESPONSE</code> whose XML body contains <code>&lt;RESULT&gt;APPROVED/STORED&lt;/RESULT&gt;</code>; each is listed as one <b>Pending</b> record keyed on its <code>SAF_NUM</code> (or <code>INTRN_SEQ_NUM</code> on builds that send no SAF number; invoice numbers repeat, so they aren't used as the key), however many times the response is repeated in the log. Resolution (CSAF/ISAF) isn't detected for this newer format yet, so those records stay Pending.</p>
       <p>After your first archive loads, use <b>"+ Add another archive"</b> to merge in more stores/exports into the same session, or <b>"Clear &amp; start over"</b> to reset everything.</p>
 
       <h4>Terms</h4>
@@ -1570,7 +1570,10 @@
 
      Keyed on SAF_NUM (fallback TRANS_SEQ_NUM), NOT on <INVOICE>: invoice numbers repeat across
      days on these devices and would merge different sales. The same SAF_NUM showing up in more
-     than one rotated file (or archive) keeps a single record.
+     than one rotated file (or archive) keeps a single record. Some builds omit both and also
+     log the same approved response many times (POS re-polls); those are keyed on INTRN_SEQ_NUM
+     and the earliest occurrence supplies createdAt. The XML may be pretty-printed (one tag per
+     line) or single-line — both are handled because fields are read from the merged text.
 
      TODO (resolution not implemented — no drained-device sample in this format yet). Candidate
      log lines to key off once one is available:
@@ -1586,10 +1589,10 @@
       for(const rawLine of entry.text.split(/\r?\n/)){
         const lm = rawLine.match(reOsLine);
         if(lm){
-          cur = {tsRaw: lm[1], tag: lm[2], content: lm[3], file: entry.name};
+          cur = {tsRaw: lm[1], tag: lm[2], content: lm[3].replace(/\r/g, ''), file: entry.name};
           allEntries.push(cur);
         } else if(cur){
-          cur.content += '\n' + rawLine;
+          cur.content += '\n' + rawLine.replace(/\r/g, ''); // some builds emit a stray CR mid-tag ("STORED\r</RESULT>")
         }
       }
       await yieldToUI();
@@ -1604,9 +1607,12 @@
     for(let i = 0; i < allEntries.length; i++){
       const e = allEntries[i];
       if(e.tag !== 'SCI_RESPONSE' || e.content.indexOf('<RESULT>APPROVED/STORED</RESULT>') < 0) continue;
+      // Key preference: SAF_NUM, then TRANS_SEQ_NUM, then (builds that send neither) the
+      // device's INTRN_SEQ_NUM under its own prefix so it can never collide with a SAF number.
       const safNum = xmlField(e.content, 'SAF_NUM') || xmlField(e.content, 'TRANS_SEQ_NUM');
-      if(!safNum) continue;
-      const recKey = recordKey(serial, 'SAF-' + safNum);
+      const intrnNum = safNum ? '' : xmlField(e.content, 'INTRN_SEQ_NUM');
+      if(!safNum && !intrnNum) continue;
+      const recKey = recordKey(serial, safNum ? 'SAF-' + safNum : 'INTRN-' + intrnNum);
       if(records.has(recKey)) continue; // same SAF_NUM already seen (overlapping rotated file / archive)
       const tsNorm = normalizeOsTs(e.tsRaw);
       const body = e.content.replace(/\s+/g, ' ').trim();
