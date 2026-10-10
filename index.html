@@ -604,6 +604,7 @@
 
       <h4>Loading logs</h4>
       <p>Drag a <b>.zip</b>, <b>.tgz</b>/<b>.tar.gz</b>, or <b>.tar</b> archive onto the drop zone, or click it to browse. Archives nested inside other archives are unwrapped automatically. Accepted logs: <code>system.dayYYYYMMDD.log</code> exports and <code>scaapp*.log</code> pinpad OS log bundles.</p>
+      <p><b>OS-log SAF formats.</b> Two <code>scaapp*.log</code> formats are recognised. Older builds log SAF as <code>ADDRECORD</code> (ELIGIBLE) / <code>UPDATERECORD</code> lines. Newer builds log each offline approval as an <code>SCI_RESPONSE</code> whose XML body contains <code>&lt;RESULT&gt;APPROVED/STORED&lt;/RESULT&gt;</code>; each is listed as one <b>Pending</b> record keyed on its <code>SAF_NUM</code> (invoice numbers repeat across days, so they aren't used as the key). Resolution (CSAF/ISAF) isn't detected for this newer format yet, so those records stay Pending.</p>
       <p>After your first archive loads, use <b>"+ Add another archive"</b> to merge in more stores/exports into the same session, or <b>"Clear &amp; start over"</b> to reset everything.</p>
 
       <h4>Terms</h4>
@@ -1561,6 +1562,76 @@
     }
   }
 
+  /* ---------------- core parser (OS log, "SSI offline stored" format) ----------------
+     Newer SCA builds write no ADDRECORD(ELIGIBLE)/UPDATERECORD lines at all. A sale approved
+     offline is logged instead as an SCI_RESPONSE whose XML body — on the lines FOLLOWING the
+     timestamped one, with no timestamp of their own — carries <RESULT>APPROVED/STORED</RESULT>.
+     Those continuation lines are merged back onto the previous timestamped entry first.
+
+     Keyed on SAF_NUM (fallback TRANS_SEQ_NUM), NOT on <INVOICE>: invoice numbers repeat across
+     days on these devices and would merge different sales. The same SAF_NUM showing up in more
+     than one rotated file (or archive) keeps a single record.
+
+     TODO (resolution not implemented — no drained-device sample in this format yet). Candidate
+     log lines to key off once one is available:
+       - "SAF Records Present to Post it to SSI"
+       - "Successfully Purged SAF Records"
+       - "Request Successfully Posted and Received Response Successfully From SSI Host"
+     "Purged" is AMBIGUOUS — it does not by itself say approved vs. declined, so it must not be
+     mapped to either. Until then every record created here stays PENDING. */
+  async function parseSsiOfflineStored(fileEntries, serial, records){
+    const allEntries = [];
+    for(const entry of fileEntries){
+      let cur = null;
+      for(const rawLine of entry.text.split(/\r?\n/)){
+        const lm = rawLine.match(reOsLine);
+        if(lm){
+          cur = {tsRaw: lm[1], tag: lm[2], content: lm[3], file: entry.name};
+          allEntries.push(cur);
+        } else if(cur){
+          cur.content += '\n' + rawLine;
+        }
+      }
+      await yieldToUI();
+    }
+    // stable sort: rotated files overlap in date, so chronology comes from each timestamp
+    allEntries.sort((a,b) => osTsToEpoch(a.tsRaw) - osTsToEpoch(b.tsRaw));
+
+    const xmlField = (xml, name) => {
+      const m = xml.match(new RegExp('<' + name + '>([^<]*)</' + name + '>'));
+      return m ? m[1].trim() : '';
+    };
+    for(let i = 0; i < allEntries.length; i++){
+      const e = allEntries[i];
+      if(e.tag !== 'SCI_RESPONSE' || e.content.indexOf('<RESULT>APPROVED/STORED</RESULT>') < 0) continue;
+      const safNum = xmlField(e.content, 'SAF_NUM') || xmlField(e.content, 'TRANS_SEQ_NUM');
+      if(!safNum) continue;
+      const recKey = recordKey(serial, 'SAF-' + safNum);
+      if(records.has(recKey)) continue; // same SAF_NUM already seen (overlapping rotated file / archive)
+      const tsNorm = normalizeOsTs(e.tsRaw);
+      const body = e.content.replace(/\s+/g, ' ').trim();
+      const cleanRaw = (e.tsRaw + '   ' + e.tag + '   ' + body).slice(0, 600) + (body.length > 600 ? '…' : '');
+      records.set(recKey, {
+        invoice: xmlField(e.content, 'INVOICE'),
+        description: `${xmlField(e.content, 'PAYMENT_TYPE')} SALE`.trim(),
+        amount: parseFloat(xmlField(e.content, 'TRANS_AMOUNT')) || 0,
+        createdAt: tsNorm,
+        createdFile: e.file,
+        status: 'PENDING',
+        attempts: [],
+        resolvedAt: null,
+        resolutionReason: '',
+        counters: null,
+        rawLines: [{ts: tsNorm, raw: cleanRaw, file: e.file}],
+        source: 'oslog',
+        card: `${xmlField(e.content, 'PAYMENT_MEDIA')} ${xmlField(e.content, 'ACCT_NUM')}`.trim(),
+        serial
+      });
+      bumpDaily(dateStrFromTs(tsNorm), 'created');
+      if(i % 3000 === 0) await yieldToUI();
+    }
+  }
+
   // finalize: sort rawLines/attempts chronologically and (re)build the RECORDS array
   // from the persistent map — called once after every archive is parsed, of either kind.
   // Every branch in both parsers pushes a rawLines entry (with the source file name) whenever
@@ -1964,6 +2035,7 @@
         await parseOSLogEntries(oslogEntries, serial, SAF_RECORD_MAP, (name, i, total) => {
           bootProgress(singleMode ? `reading file ${i} of ${total}…` : `archive ${archiveIndex} of ${archiveTotal} — file ${i} of ${total}…`);
         });
+        await parseSsiOfflineStored(oslogEntries, serial, SAF_RECORD_MAP);
       }
       buildRecordsArray();
       const theseFileNames = [...systemdayEntries.map(e => e.name), ...oslogEntries.map(e => e.name)];
